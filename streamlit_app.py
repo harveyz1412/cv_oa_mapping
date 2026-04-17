@@ -56,27 +56,107 @@ def token_overlap(a: str, b: str) -> float:
     return len(ta & tb) / len(ta)
 
 
+def char_ngram_dice(a: str, b: str, n: int = 3) -> float:
+    """Character n-gram overlap; helps with minor typos in compact names."""
+    if not a or not b:
+        return 0.0
+    if len(a) < n or len(b) < n:
+        return 1.0 if a == b else 0.0
+    a_ngrams = {a[i:i + n] for i in range(len(a) - n + 1)}
+    b_ngrams = {b[i:i + n] for i in range(len(b) - n + 1)}
+    if not a_ngrams or not b_ngrams:
+        return 0.0
+    return (2.0 * len(a_ngrams & b_ngrams)) / (len(a_ngrams) + len(b_ngrams))
+
+
+def build_vocab(reference_fields: list) -> list:
+    vocab = set()
+    for field in reference_fields:
+        for tok in normalize(field).split():
+            if len(tok) >= 3:
+                vocab.add(tok)
+    return sorted(vocab, key=len, reverse=True)
+
+
+def tokenize_with_vocab(text: str, vocab: list) -> list:
+    """Tokenize by separators first; for compact strings, recover known tokens by scan.
+    This allows order-agnostic matches like 'diagadmit' ~= 'admit diag'.
+    """
+    base_tokens = [t for t in normalize(text).split() if t]
+    if len(base_tokens) > 1:
+        return base_tokens
+
+    compact = compress(text)
+    if not compact:
+        return base_tokens
+
+    matched = []
+    i = 0
+    while i < len(compact):
+        best = ""
+        for tok in vocab:
+            c_tok = compress(tok)
+            if len(c_tok) < 3:
+                continue
+            if compact.startswith(c_tok, i) and len(c_tok) > len(best):
+                best = c_tok
+        if best:
+            matched.append(best)
+            i += len(best)
+        else:
+            i += 1
+
+    return matched if matched else base_tokens
+
+
+def orderless_token_score(input_tokens: list, ref_tokens: list) -> float:
+    if not input_tokens or not ref_tokens:
+        return 0.0
+    in_set = set(input_tokens)
+    ref_set = set(ref_tokens)
+    overlap = len(in_set & ref_set) / max(1, len(in_set))
+    seq = lcs_ratio(" ".join(sorted(input_tokens)), " ".join(sorted(ref_tokens)))
+    return 0.6 * overlap + 0.4 * seq
+
+
 # ---------------------------------------------------------------------------
 # Scoring / mapping
 # ---------------------------------------------------------------------------
 
-def score_pair(input_field: str, ref_field: str) -> float:
+def score_details(input_field: str, ref_field: str, input_tokens: list, ref_tokens: list) -> dict:
     c_input = compress(input_field)
     c_ref = compress(ref_field)
     lcs = lcs_ratio(c_input, c_ref)
     tok = token_overlap(input_field, ref_field)
-    return 0.7 * lcs + 0.3 * tok
+    ngram = char_ngram_dice(c_input, c_ref)
+    orderless = orderless_token_score(input_tokens, ref_tokens)
+    total = 0.45 * lcs + 0.20 * tok + 0.20 * orderless + 0.15 * ngram
+    return {
+        "total": total,
+        "lcs": lcs,
+        "token": tok,
+        "orderless": orderless,
+        "ngram": ngram,
+    }
 
 
 def map_fields(client_fields: list, ref_df: pd.DataFrame) -> pd.DataFrame:
     cotiviti_fields = ref_df[TARGET_COL].astype(str).tolist()
     raw_client_fields = ref_df[RAW_COL].astype(str).tolist()
+    vocab = build_vocab(raw_client_fields)
+    ref_tokens_list = [tokenize_with_vocab(ref, vocab) for ref in raw_client_fields]
 
     rows = []
     for field in client_fields:
-        scores = [score_pair(field, ref) for ref in raw_client_fields]
+        input_tokens = tokenize_with_vocab(field, vocab)
+        details = [
+            score_details(field, ref, input_tokens, ref_tokens)
+            for ref, ref_tokens in zip(raw_client_fields, ref_tokens_list)
+        ]
+        scores = [d["total"] for d in details]
         best_idx = int(np.argmax(scores))
         score = scores[best_idx]
+        best = details[best_idx]
         cotiviti = cotiviti_fields[best_idx]
         matched_ref = raw_client_fields[best_idx]
 
@@ -91,6 +171,10 @@ def map_fields(client_fields: list, ref_df: pd.DataFrame) -> pd.DataFrame:
             "Client Field": field,
             "Suggested Cotiviti Field": cotiviti,
             "Score": round(score, 2),
+            "Score Breakdown": (
+                f"LCS {best['lcs']:.2f} | Token {best['token']:.2f} | "
+                f"Orderless {best['orderless']:.2f} | NGram {best['ngram']:.2f}"
+            ),
             "Confidence": confidence,
             "Status": status,
             "Best Reference Match": f"Best match: {matched_ref}",
@@ -229,6 +313,7 @@ if "result_df" in st.session_state:
         num_rows="fixed",
         column_config={
             "Score": st.column_config.NumberColumn(format="%.2f"),
+            "Score Breakdown": st.column_config.TextColumn(),
             "Confidence": st.column_config.SelectboxColumn(
                 options=["High", "Medium", "Low"], required=True
             ),
@@ -237,7 +322,7 @@ if "result_df" in st.session_state:
                 required=True,
             ),
         },
-        disabled=["Client Field", "Score", "Confidence", "Status", "Best Reference Match"],
+        disabled=["Client Field", "Score", "Score Breakdown", "Confidence", "Status", "Best Reference Match"],
         key="result_editor",
     )
 
