@@ -17,7 +17,7 @@ import streamlit as st
 # ---------------------------------------------------------------------------
 RAW_COL = "Client Data Fields"
 TARGET_COL = "Cotiviti Data Fields"
-BUNDLED_REF = os.path.join(os.path.dirname(__file__), "Data_Mod_Mapping_Reference.xlsx")
+BUNDLED_REF = os.path.join(os.path.dirname(__file__), "CV_OA_Mapping_reference.xlsx")
 
 # ---------------------------------------------------------------------------
 # Text normalisation
